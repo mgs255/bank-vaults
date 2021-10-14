@@ -15,8 +15,11 @@
 package main
 
 import (
+	"crypto/tls"
 	"net/http"
+	"sync"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
@@ -61,6 +64,90 @@ func handlerFor(config mutating.WebhookConfig, recorder whwebhook.MetricsRecorde
 	wh = whwebhook.NewMeasuredWebhook(recorder, wh)
 
 	return whhttp.MustHandlerFor(whhttp.HandlerConfig{Webhook: wh, Logger: config.Logger})
+}
+
+type keypairReloader struct {
+	certMu   sync.RWMutex
+	cert     *tls.Certificate
+	certPath string
+	keyPath  string
+	logger   *logrus.Entry
+}
+
+func NewKeypairReloader(logger *logrus.Entry, certPath, keyPath string) (*keypairReloader, error) {
+	result := &keypairReloader{
+		certPath: certPath,
+		keyPath:  keyPath,
+		logger:   logger,
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, err
+	}
+	result.cert = &cert
+
+	return result, nil
+}
+
+func (kpr *keypairReloader) tryReloadingCert() error {
+	newCert, err := tls.LoadX509KeyPair(kpr.certPath, kpr.keyPath)
+	if err != nil {
+		kpr.logger.Fatalf("unable to load key pair: %s", err)
+		return err
+	}
+
+	kpr.certMu.Lock()
+	defer kpr.certMu.Unlock()
+	kpr.cert = &newCert
+
+	return nil
+}
+
+func watchDir(kpr *keypairReloader) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		kpr.logger.Fatal(err)
+	}
+	defer watcher.Close()
+
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&fsnotify.Write == fsnotify.Write {
+					kpr.tryReloadingCert()
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				kpr.logger.Fatalf("event error: %s", err)
+			}
+		}
+	}()
+
+	err = watcher.Add(kpr.certPath)
+	if err != nil {
+		kpr.logger.Fatalf("Unable to watch certificate %s for updates: %s", kpr.certPath, err)
+	}
+
+	err = watcher.Add(kpr.keyPath)
+	if err != nil {
+		kpr.logger.Fatalf("Unable to watch key %s for updates: %s", kpr.certPath, err)
+	}
+	<-done
+}
+
+func (kpr *keypairReloader) GetCertificateFunc() func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	return func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		kpr.certMu.RLock()
+		defer kpr.certMu.RUnlock()
+		return kpr.cert, nil
+	}
 }
 
 func main() {
@@ -130,8 +217,24 @@ func main() {
 		logger.Infof("Listening on http://%s", listenAddress)
 		err = http.ListenAndServe(listenAddress, mux)
 	} else {
+		kpr, err := NewKeypairReloader(logger, tlsCertFile, tlsPrivateKeyFile)
+		if err != nil {
+			logger.Fatal(err)
+		}
+
+		tlsConf := &tls.Config{
+			Certificates:   nil,
+			GetCertificate: kpr.GetCertificateFunc(),
+		}
+
+		srv := &http.Server{
+			Addr:      listenAddress,
+			Handler:   mux,
+			TLSConfig: tlsConf,
+		}
+
 		logger.Infof("Listening on https://%s", listenAddress)
-		err = http.ListenAndServeTLS(listenAddress, tlsCertFile, tlsPrivateKeyFile, mux)
+		err = srv.ListenAndServeTLS("", "")
 	}
 
 	if err != nil {
