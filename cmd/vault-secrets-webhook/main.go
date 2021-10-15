@@ -90,6 +90,7 @@ func NewKeypairReloader(logger *logrus.Entry, certPath, keyPath string) (*keypai
 }
 
 func (kpr *keypairReloader) tryReloadingCert() error {
+	kpr.logger.Warnf("Reloading certificate: %s and key: %s", kpr.certPath, kpr.keyPath)
 	newCert, err := tls.LoadX509KeyPair(kpr.certPath, kpr.keyPath)
 	if err != nil {
 		kpr.logger.Fatalf("unable to load key pair: %s", err)
@@ -103,11 +104,13 @@ func (kpr *keypairReloader) tryReloadingCert() error {
 	return nil
 }
 
-func watchDir(kpr *keypairReloader) {
+func (kpr *keypairReloader) watchDir() error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		kpr.logger.Fatal(err)
+		return err
 	}
+
 	defer watcher.Close()
 
 	done := make(chan bool)
@@ -130,16 +133,22 @@ func watchDir(kpr *keypairReloader) {
 		}
 	}()
 
+	kpr.logger.Infof("Watching certificate %s for updates", kpr.certPath)
 	err = watcher.Add(kpr.certPath)
 	if err != nil {
 		kpr.logger.Fatalf("Unable to watch certificate %s for updates: %s", kpr.certPath, err)
+		return err
 	}
 
+	kpr.logger.Infof("Watching key %s for updates", kpr.keyPath)
 	err = watcher.Add(kpr.keyPath)
 	if err != nil {
-		kpr.logger.Fatalf("Unable to watch key %s for updates: %s", kpr.certPath, err)
+		kpr.logger.Fatalf("Unable to watch key %s for updates: %s", kpr.keyPath, err)
+		return err
 	}
 	<-done
+
+	return nil
 }
 
 func (kpr *keypairReloader) GetCertificateFunc() func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -221,6 +230,10 @@ func main() {
 		if err != nil {
 			logger.Fatal(err)
 		}
+
+		logger.Infof("Initiating watch of cert updates...")
+		go kpr.watchDir()
+		logger.Infof("Started watch....")
 
 		tlsConf := &tls.Config{
 			Certificates:   nil,
